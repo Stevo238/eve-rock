@@ -540,8 +540,8 @@ class MainWindow(QMainWindow):
         self._market_prices: dict[int, float]               = {}
 
         self.setWindowTitle("EVE Rock – Mining Tracker")
-        self.setMinimumSize(1200, 680)
-        self.resize(1500, 800)
+        self.setMinimumSize(1280, 720)
+        self.resize(1600, 860)
         self._build_ui()
         self._load_existing_characters()
         self._fetch_prices_bg()   # load prices in background on startup
@@ -773,7 +773,7 @@ class MainWindow(QMainWindow):
 
         # ── Left character-filter panel ───────────────────────────────
         char_panel = QWidget()
-        char_panel.setFixedWidth(160)
+        char_panel.setFixedWidth(140)
         char_panel.setStyleSheet(
             f"background-color: {PANEL_BG}; border-right: 1px solid {BORDER};"
         )
@@ -907,11 +907,12 @@ class MainWindow(QMainWindow):
         ])
         _setup_table(self._moon_table)
         hv = self._moon_table.horizontalHeader()
+        hv.setMinimumSectionSize(70)
         for col, mode in [
-            (0, QHeaderView.ResizeMode.Stretch),
-            (1, QHeaderView.ResizeMode.ResizeToContents),
-            (2, QHeaderView.ResizeMode.ResizeToContents),
-            (3, QHeaderView.ResizeMode.ResizeToContents),
+            (0, QHeaderView.ResizeMode.Interactive),   # Observer / Refinery
+            (1, QHeaderView.ResizeMode.Interactive),   # Character
+            (2, QHeaderView.ResizeMode.Stretch),       # Ore / Ice Type
+            (3, QHeaderView.ResizeMode.Interactive),   # Group
             (4, QHeaderView.ResizeMode.ResizeToContents),
             (5, QHeaderView.ResizeMode.ResizeToContents),
             (6, QHeaderView.ResizeMode.ResizeToContents),
@@ -920,6 +921,8 @@ class MainWindow(QMainWindow):
         ]:
             hv.setSectionResizeMode(col, mode)
         self._moon_table.setColumnWidth(0, 220)
+        self._moon_table.setColumnWidth(1, 140)
+        self._moon_table.setColumnWidth(3, 110)
         lay.addWidget(self._moon_table)
 
         root.addWidget(right, 1)
