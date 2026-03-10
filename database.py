@@ -332,6 +332,68 @@ class Database:
         """
         return self.conn.execute(sql, params).fetchall()
 
+    def get_daily_mining_totals(
+        self,
+        char_ids:   list[int] | None = None,
+        start_date: str | None = None,
+        end_date:   str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Returns (mine_date, type_id, total_quantity, unit_volume) grouped by date × type."""
+        filters: list[str] = []
+        params:  list      = []
+        if char_ids:
+            ph = ",".join("?" * len(char_ids))
+            filters.append(f"m.character_id IN ({ph})")
+            params.extend(char_ids)
+        if start_date:
+            filters.append("m.mine_date >= ?");  params.append(start_date)
+        if end_date:
+            filters.append("m.mine_date <= ?");  params.append(end_date)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+        sql = f"""
+            SELECT  m.mine_date,
+                    m.type_id,
+                    SUM(m.quantity)          AS total_quantity,
+                    COALESCE(tc.volume, 0.0) AS unit_volume
+            FROM    mining_ledger m
+            LEFT JOIN type_cache tc ON m.type_id = tc.type_id
+            {where}
+            GROUP BY m.mine_date, m.type_id
+            ORDER BY m.mine_date
+        """
+        return self.conn.execute(sql, params).fetchall()
+
+    def get_mining_isk_by_character(
+        self,
+        char_ids:   list[int] | None = None,
+        start_date: str | None = None,
+        end_date:   str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Returns (character_name, type_id, total_quantity) for dashboard ISK computation."""
+        filters: list[str] = []
+        params:  list      = []
+        if char_ids:
+            ph = ",".join("?" * len(char_ids))
+            filters.append(f"m.character_id IN ({ph})")
+            params.extend(char_ids)
+        if start_date:
+            filters.append("m.mine_date >= ?");  params.append(start_date)
+        if end_date:
+            filters.append("m.mine_date <= ?");  params.append(end_date)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+        sql = f"""
+            SELECT  m.character_id,
+                    COALESCE(c.character_name, 'Char '||m.character_id) AS character_name,
+                    m.type_id,
+                    SUM(m.quantity) AS total_quantity
+            FROM    mining_ledger m
+            LEFT JOIN characters c ON m.character_id = c.character_id
+            {where}
+            GROUP BY m.character_id, m.type_id
+            ORDER BY m.character_id
+        """
+        return self.conn.execute(sql, params).fetchall()
+
     # ------------------------------------------------------------------
     # Moon mining (current cycle)
     # ------------------------------------------------------------------

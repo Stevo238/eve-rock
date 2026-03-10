@@ -14,8 +14,8 @@ import csv
 import sys
 from datetime import datetime, timedelta
 
-from PyQt6.QtCore    import Qt, QDate, QSize, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui     import QColor, QFont
+from PyQt6.QtCore    import Qt, QDate, QRect, QSize, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui     import QBrush, QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
@@ -243,6 +243,30 @@ def _pill(text: str, color: str = TEXT_SEC) -> QLabel:
     return lbl
 
 
+def _kpi_card(title: str) -> "tuple[QFrame, QLabel]":
+    """Create a KPI summary card.  Returns (outer_frame, value_label)."""
+    frame = QFrame()
+    frame.setStyleSheet(
+        f"QFrame {{ background-color: {PANEL_BG}; border: 1px solid {BORDER}; border-radius: 8px; }}"
+    )
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(14, 10, 14, 10)
+    lay.setSpacing(2)
+    t = QLabel(title.upper())
+    t.setStyleSheet(
+        f"color: {TEXT_SEC}; font-size: 10px; font-weight: bold;"
+        f" letter-spacing: 1px; background: transparent; border: none;"
+    )
+    lay.addWidget(t)
+    v = QLabel("\u2014")
+    v.setStyleSheet(
+        f"color: {ORE_GOLD}; font-size: 20px; font-weight: 700;"
+        f" background: transparent; border: none;"
+    )
+    lay.addWidget(v)
+    return frame, v
+
+
 def _setup_table(tbl: QTableWidget) -> None:
     tbl.verticalHeader().setVisible(False)
     tbl.verticalHeader().setDefaultSectionSize(32)
@@ -269,6 +293,134 @@ def _num_cell(value: float, display: str) -> QTableWidgetItem:
     item.setData(Qt.ItemDataRole.UserRole,    value)
     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     return item
+
+
+# ── Chart widgets ────────────────────────────────────────────────────────────────
+
+class BarChartWidget(QWidget):
+    """Vertical bar chart – daily ISK timeline."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data: list[tuple[str, float]] = []
+        self.setMinimumHeight(180)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"background-color: {PANEL_BG}; border: 1px solid {BORDER}; border-radius: 8px;"
+        )
+
+    def set_data(self, data: list[tuple[str, float]]):
+        self._data = list(data)
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        pad_l, pad_r, pad_t, pad_b = 72, 12, 14, 36
+        p.fillRect(0, 0, W, H, QColor(PANEL_BG))
+        if not self._data:
+            p.setPen(QColor(TEXT_SEC))
+            f = p.font(); f.setPointSize(10); p.setFont(f)
+            p.drawText(QRect(0, 0, W, H), Qt.AlignmentFlag.AlignCenter, "No mining data yet")
+            return
+        chart_w = W - pad_l - pad_r
+        chart_h = H - pad_t - pad_b
+        if chart_w < 1 or chart_h < 1:
+            return
+        max_val = max(v for _, v in self._data) or 1.0
+        n       = len(self._data)
+        spacing = 2
+        bar_w   = max(2, chart_w // n - spacing)
+        sf = p.font(); sf.setPointSize(8); p.setFont(sf)
+        for i in range(5):
+            frac = i / 4
+            y    = pad_t + chart_h - int(frac * chart_h)
+            p.setPen(QPen(QColor(BORDER if i == 0 else "#1e242b"), 1))
+            p.drawLine(pad_l, y, W - pad_r, y)
+            p.setPen(QColor(TEXT_SEC))
+            p.drawText(QRect(0, y - 8, pad_l - 4, 16),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       _fmt_isk(frac * max_val))
+        p.setPen(Qt.PenStyle.NoPen)
+        bar_color = QColor(ACCENT_BLUE)
+        for i, (_, val) in enumerate(self._data):
+            bh = int((val / max_val) * chart_h)
+            if bh < 1:
+                continue
+            bx = pad_l + int(i * chart_w / n) + spacing
+            by = pad_t + chart_h - bh
+            p.setBrush(QBrush(bar_color))
+            p.drawRoundedRect(bx, by, bar_w, bh, 2.0, 2.0)
+        p.setPen(QColor(TEXT_SEC))
+        step = max(1, n // 8)
+        for i, (date_str, _) in enumerate(self._data):
+            if i % step == 0:
+                bx = pad_l + int(i * chart_w / n) + spacing
+                p.drawText(QRect(bx - 14, H - pad_b + 4, bar_w + 28, 18),
+                           Qt.AlignmentFlag.AlignCenter, date_str[5:])
+        p.setPen(QPen(QColor(BORDER), 1))
+        p.drawLine(pad_l, pad_t + chart_h, W - pad_r, pad_t + chart_h)
+
+
+class HBarChartWidget(QWidget):
+    """Horizontal bar chart – top miners or top ore types."""
+
+    _PALETTE = [ACCENT_BLUE, ORE_GOLD, ACCENT_GREEN, ICE_CYAN,
+                WARN_YELLOW, DANGER_RED, "#a371f7", "#f0883e"]
+
+    def __init__(self, parent=None, bar_color: str | None = None):
+        super().__init__(parent)
+        self._data:     list[tuple[str, float]] = []
+        self._fmt       = _fmt_isk
+        self._bar_color = bar_color
+        self.setMinimumHeight(120)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"background-color: {PANEL_BG}; border: 1px solid {BORDER}; border-radius: 8px;"
+        )
+
+    def set_data(self, data: list[tuple[str, float]], fmt=None):
+        self._data = list(data)[:8]
+        self._fmt  = fmt or _fmt_isk
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, QColor(PANEL_BG))
+        if not self._data:
+            p.setPen(QColor(TEXT_SEC))
+            f = p.font(); f.setPointSize(10); p.setFont(f)
+            p.drawText(QRect(0, 0, W, H), Qt.AlignmentFlag.AlignCenter, "No data")
+            return
+        n        = len(self._data)
+        max_val  = max(v for _, v in self._data) or 1.0
+        pad      = 10
+        label_w  = 130
+        val_w    = 90
+        bar_area = max(1, W - pad - label_w - val_w - pad)
+        row_h    = max(16, (H - pad * 2) // n)
+        sf = p.font(); sf.setPointSize(9); p.setFont(sf)
+        for i, (label, val) in enumerate(self._data):
+            y     = pad + i * row_h
+            bh    = max(4, row_h - 6)
+            bw    = int((val / max_val) * bar_area)
+            bx    = pad + label_w + 4
+            color = QColor(self._bar_color) if self._bar_color else QColor(self._PALETTE[i % len(self._PALETTE)])
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(color))
+            if bw > 0:
+                p.drawRoundedRect(bx, y + 3, bw, bh, 3.0, 3.0)
+            p.setPen(QColor(TEXT_PRIMARY))
+            p.drawText(QRect(pad, y, label_w, row_h),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       label[:20])
+            p.setPen(QColor(TEXT_SEC))
+            p.drawText(QRect(bx + bar_area + 4, y, val_w - 4, row_h),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       self._fmt(val))
 
 
 # ── Background workers ─────────────────────────────────────────────────────────
@@ -660,15 +812,98 @@ class MainWindow(QMainWindow):
 
         # Tabs
         self._tabs = QTabWidget()
+        self._tab_dash    = self._build_tab_dashboard()
         self._tab_mining  = self._build_tab_mining()
         self._tab_moon    = self._build_tab_moon()
         self._tab_summary = self._build_tab_summary()
+        self._tabs.addTab(self._tab_dash,    "🏠  Dashboard")
         self._tabs.addTab(self._tab_mining,  "⛏  Character Mining")
         self._tabs.addTab(self._tab_moon,    "🌙  Moon Mining")
         self._tabs.addTab(self._tab_summary, "📊  Summary")
         self._tabs.currentChanged.connect(self._on_tab_changed)
         lay.addWidget(self._tabs)
         return panel
+
+    # ── Tab: Dashboard ────────────────────────────────────────────────
+
+    def _build_tab_dashboard(self) -> QWidget:
+        w   = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(12)
+
+        # Period filter
+        fbar = QHBoxLayout(); fbar.setSpacing(12)
+        fbar.addWidget(QLabel("Period:"))
+        self._dash_period = QComboBox()
+        for label, _ in _PERIOD_OPTIONS:
+            self._dash_period.addItem(label)
+        self._dash_period.setCurrentIndex(1)   # 30 days default
+        self._dash_period.currentIndexChanged.connect(self._on_dash_period_changed)
+        fbar.addWidget(self._dash_period)
+
+        today = QDate.currentDate()
+        self._dash_from_lbl = QLabel("From:")
+        self._dash_from_lbl.setVisible(False)
+        fbar.addWidget(self._dash_from_lbl)
+        self._dash_from = QDateEdit(today.addDays(-30))
+        self._dash_from.setCalendarPopup(True)
+        self._dash_from.setDisplayFormat("yyyy-MM-dd")
+        self._dash_from.setVisible(False)
+        self._dash_from.dateChanged.connect(self._refresh_dashboard_tab)
+        fbar.addWidget(self._dash_from)
+
+        self._dash_to_lbl = QLabel("To:")
+        self._dash_to_lbl.setVisible(False)
+        fbar.addWidget(self._dash_to_lbl)
+        self._dash_to = QDateEdit(today)
+        self._dash_to.setCalendarPopup(True)
+        self._dash_to.setDisplayFormat("yyyy-MM-dd")
+        self._dash_to.setVisible(False)
+        self._dash_to.dateChanged.connect(self._refresh_dashboard_tab)
+        fbar.addWidget(self._dash_to)
+        fbar.addStretch()
+        lay.addLayout(fbar)
+
+        # KPI cards
+        kpi_row = QHBoxLayout(); kpi_row.setSpacing(12)
+        isk_card,   self._kpi_isk_lbl   = _kpi_card("Est. ISK")
+        vol_card,   self._kpi_vol_lbl   = _kpi_card("Volume")
+        chars_card, self._kpi_chars_lbl = _kpi_card("Characters")
+        days_card,  self._kpi_days_lbl  = _kpi_card("Mining Days")
+        types_card, self._kpi_types_lbl = _kpi_card("Ore Types")
+        for card in (isk_card, vol_card, chars_card, days_card, types_card):
+            kpi_row.addWidget(card)
+        lay.addLayout(kpi_row)
+
+        # Charts row
+        charts = QHBoxLayout(); charts.setSpacing(12)
+
+        tl_col = QVBoxLayout(); tl_col.setSpacing(6)
+        tl_lbl = QLabel("ISK PER DAY")
+        tl_lbl.setObjectName("section_label")
+        tl_col.addWidget(tl_lbl)
+        self._timeline_chart = BarChartWidget()
+        tl_col.addWidget(self._timeline_chart, 1)
+        charts.addLayout(tl_col, 3)
+
+        rt_col = QVBoxLayout(); rt_col.setSpacing(6)
+        tc_lbl = QLabel("TOP CHARACTERS  (Est. ISK)")
+        tc_lbl.setObjectName("section_label")
+        rt_col.addWidget(tc_lbl)
+        self._top_chars_chart = HBarChartWidget(bar_color=ACCENT_BLUE)
+        self._top_chars_chart.setMinimumHeight(140)
+        rt_col.addWidget(self._top_chars_chart, 1)
+        tt_lbl = QLabel("TOP ORE TYPES  (Est. ISK)")
+        tt_lbl.setObjectName("section_label")
+        rt_col.addWidget(tt_lbl)
+        self._top_types_chart = HBarChartWidget(bar_color=ORE_GOLD)
+        self._top_types_chart.setMinimumHeight(140)
+        rt_col.addWidget(self._top_types_chart, 1)
+        charts.addLayout(rt_col, 2)
+
+        lay.addLayout(charts, 1)
+        return w
 
     # ── Tab: Character Mining ──────────────────────────────────────────
 
@@ -1296,11 +1531,23 @@ class MainWindow(QMainWindow):
             return
         idx = self._tabs.currentIndex()
         if idx == 0:
-            self._refresh_mining_tab()
+            self._refresh_dashboard_tab()
         elif idx == 1:
-            self._refresh_moon_tab()
+            self._refresh_mining_tab()
         elif idx == 2:
+            self._refresh_moon_tab()
+        elif idx == 3:
             self._refresh_summary_tab()
+
+    def _on_dash_period_changed(self):
+        idx    = self._dash_period.currentIndex()
+        days   = _PERIOD_OPTIONS[idx][1] if idx >= 0 else 30
+        custom = (days == -1)
+        self._dash_from_lbl.setVisible(custom)
+        self._dash_from.setVisible(custom)
+        self._dash_to_lbl.setVisible(custom)
+        self._dash_to.setVisible(custom)
+        self._refresh_dashboard_tab()
 
     def _on_mining_period_changed(self):
         idx  = self._mining_period.currentIndex()
@@ -1345,6 +1592,55 @@ class MainWindow(QMainWindow):
     def _get_selected_char_ids(self) -> list[int] | None:
         cid = self._selected_char_id()
         return [cid] if cid is not None else None
+
+    # ── Dashboard tab ──────────────────────────────────────────────────
+
+    def _refresh_dashboard_tab(self):
+        char_ids             = self._get_selected_char_ids()
+        start_date, end_date = self._get_date_range(
+            self._dash_period, self._dash_from, self._dash_to
+        )
+        # Per-day totals for timeline
+        daily_rows = self._db.get_daily_mining_totals(char_ids, start_date, end_date)
+        day_isk: dict[str, float] = {}
+        total_units = 0
+        total_m3    = 0.0
+        for row in daily_rows:
+            qty   = row["total_quantity"] or 0
+            price = self._market_prices.get(row["type_id"], 0.0)
+            isk   = price * qty
+            day_isk[row["mine_date"]] = day_isk.get(row["mine_date"], 0.0) + isk
+            total_units += qty
+            total_m3    += (row["unit_volume"] or 0.0) * qty
+        self._timeline_chart.set_data(sorted(day_isk.items()))
+        total_isk = sum(day_isk.values())
+
+        # Top characters by ISK
+        char_type_rows = self._db.get_mining_isk_by_character(char_ids, start_date, end_date)
+        char_isk: dict[str, float] = {}
+        for row in char_type_rows:
+            price = self._market_prices.get(row["type_id"], 0.0)
+            isk   = price * (row["total_quantity"] or 0)
+            char_isk[row["character_name"]] = char_isk.get(row["character_name"], 0.0) + isk
+        top_chars = sorted(char_isk.items(), key=lambda x: x[1], reverse=True)[:8]
+        self._top_chars_chart.set_data(top_chars, _fmt_isk)
+
+        # Top ore types by ISK
+        type_rows = self._db.get_mining_summary_by_type(char_ids, start_date, end_date)
+        ore_isk: list[tuple[str, float]] = []
+        for row in type_rows:
+            price = self._market_prices.get(row["type_id"], 0.0)
+            isk   = price * (row["total_quantity"] or 0)
+            ore_isk.append((row["type_name"] or f"Type {row['type_id']}", isk))
+        ore_isk.sort(key=lambda x: x[1], reverse=True)
+        self._top_types_chart.set_data(ore_isk[:8], _fmt_isk)
+
+        # KPI cards
+        self._kpi_isk_lbl.setText(_fmt_isk(total_isk))
+        self._kpi_vol_lbl.setText(_fmt_m3(total_m3))
+        self._kpi_chars_lbl.setText(str(len(char_isk)))
+        self._kpi_days_lbl.setText(str(len(day_isk)))
+        self._kpi_types_lbl.setText(str(len(type_rows)))
 
     # ── Mining tab ─────────────────────────────────────────────────────
 
