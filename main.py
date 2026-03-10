@@ -11,9 +11,10 @@ each person logs in with their own EVE account.
 
 Create your application at  https://developers.eveonline.com/
     • Callback URL : http://localhost:45679/callback
-    • Scopes (ESI > industry):
+    • Scopes (ESI > industry + universe):
         esi-industry.read_character_mining.v1
         esi-industry.read_corporation_mining.v1
+        esi-universe.read_structures.v1
 """
 
 import sys
@@ -23,7 +24,7 @@ from PyQt6.QtWidgets import QApplication, QInputDialog, QMessageBox
 from ui import MainWindow, STYLESHEET
 
 # ── Paste your Client ID here before building the exe ──────────────────────────
-BAKED_CLIENT_ID = ""   # ← paste your Client ID before running / building
+BAKED_CLIENT_ID = "c8f989dcf2604f9e8c4214f42c5d2396"
 # ───────────────────────────────────────────────────────────────────────────────
 
 

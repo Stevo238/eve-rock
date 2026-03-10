@@ -10,14 +10,15 @@ Right content – QTabWidget with three tabs:
     📊  Summary          – aggregate stats by character and by ore type
 """
 
+import csv
 import sys
 from datetime import datetime, timedelta
 
-from PyQt6.QtCore    import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore    import Qt, QDate, QSize, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui     import QColor, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPushButton, QSizePolicy, QSplitter, QStatusBar, QTabWidget,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -200,6 +201,7 @@ _PERIOD_OPTIONS = [
     ("Last 90 days",  90),
     ("Last 180 days", 180),
     ("All time",      None),
+    ("Custom range",  -1),   # -1 = use date pickers
 ]
 
 
@@ -313,12 +315,6 @@ class SyncWorker(QThread):
         self._char_ids  = char_ids              # None → sync all
 
     def run(self):
-        prices = {}
-        try:
-            prices = esi.get_market_prices()
-        except Exception:
-            pass
-
         for char_id_str, token in self._tokens.items():
             char_id = int(char_id_str)
             if self._char_ids and char_id not in self._char_ids:
@@ -350,13 +346,26 @@ class SyncWorker(QThread):
                     if new_type_ids:
                         self.progress.emit(f"{char_name}: fetching {len(new_type_ids)} ore type(s)…")
                         type_infos = esi.get_types_batch(new_type_ids, access)
+                        # Collect unique group IDs then batch-resolve group names
+                        group_ids = list({info["group_id"] for info in type_infos.values() if info.get("group_id")})
+                        group_names = esi.get_groups_batch(group_ids, access)
                         for tid, info in type_infos.items():
+                            gid = info.get("group_id")
                             self._db.save_type_info(
                                 tid,
                                 info.get("name", names.get(tid, f"Type {tid}")),
                                 info.get("volume", 0.0),
-                                info.get("group_id"),
+                                gid,
+                                group_names.get(gid) if gid else None,
                             )
+                    # Back-fill group names for any previously cached types missing them
+                    missing = self._db.get_types_missing_group_name()
+                    if missing:
+                        missing_gids = list({gid for _, gid in missing})
+                        gnames = esi.get_groups_batch(missing_gids, access)
+                        for type_id, gid in missing:
+                            if gnames.get(gid):
+                                self._db.update_group_name(type_id, gnames[gid])
 
                     # Enrich entries with resolved names
                     enriched = []
@@ -455,12 +464,24 @@ class MoonWorker(QThread):
                 self._db.save_moon_mining(obs_id, obs_name, enriched)
                 result.append({"observer_id": obs_id, "observer_name": obs_name})
 
-            # Batch-fetch unknown type volumes
+            # Batch-fetch unknown type volumes + group names
             if all_type_ids_needed:
                 self.progress.emit(f"Fetching {len(all_type_ids_needed)} ore type(s)…")
                 type_infos = esi.get_types_batch(list(all_type_ids_needed), access)
+                group_ids  = list({info["group_id"] for info in type_infos.values() if info.get("group_id")})
+                group_names = esi.get_groups_batch(group_ids, access)
                 for tid, info in type_infos.items():
-                    self._db.save_type_info(tid, info.get("name", ""), info.get("volume", 0.0), info.get("group_id"))
+                    gid = info.get("group_id")
+                    self._db.save_type_info(tid, info.get("name", ""), info.get("volume", 0.0),
+                                            gid, group_names.get(gid) if gid else None)
+            # Back-fill group names for any previously cached types missing them
+            missing = self._db.get_types_missing_group_name()
+            if missing:
+                missing_gids = list({gid for _, gid in missing})
+                gnames = esi.get_groups_batch(missing_gids, access)
+                for type_id, gid in missing:
+                    if gnames.get(gid):
+                        self._db.update_group_name(type_id, gnames[gid])
 
             self.finished.emit(result)
 
@@ -468,24 +489,82 @@ class MoonWorker(QThread):
             self.error.emit(str(exc))
 
 
+class PricesWorker(QThread):
+    """Fetches market prices in the background and emits the result."""
+    finished = pyqtSignal(dict)
+
+    def run(self):
+        try:
+            self.finished.emit(esi.get_market_prices())
+        except Exception:
+            self.finished.emit({})
+
+
+class GroupBackfillWorker(QThread):
+    """Fetches group names for any type_cache rows missing them (public ESI, no auth needed)."""
+    finished = pyqtSignal()
+
+    def __init__(self, db: Database):
+        super().__init__()
+        self._db = db
+
+    def run(self):
+        try:
+            missing = self._db.get_types_missing_group_name()
+            if not missing:
+                return
+            group_ids = list({gid for _, gid in missing})
+            gnames = esi.get_groups_batch(group_ids)   # no auth needed
+            for type_id, gid in missing:
+                if gnames.get(gid):
+                    self._db.update_group_name(type_id, gnames[gid])
+        except Exception:
+            pass
+        finally:
+            self.finished.emit()
+
+
 # ── Main window ────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
     def __init__(self, client_id: str):
         super().__init__()
-        self._client_id  = client_id
-        self._db         = Database()
-        self._tokens     = auth.load_all_tokens()   # {str(char_id): token_dict}
-        self._sync_worker: SyncWorker | None    = None
-        self._moon_worker: MoonWorker | None    = None
-        self._add_worker: AddCharacterWorker | None = None
-        self._market_prices: dict[int, float]   = {}
+        self._client_id     = client_id
+        self._db            = Database()
+        self._tokens        = auth.load_all_tokens()   # {str(char_id): token_dict}
+        self._sync_worker:   SyncWorker | None              = None
+        self._moon_worker:   MoonWorker | None              = None
+        self._add_worker:    AddCharacterWorker | None      = None
+        self._prices_worker: PricesWorker | None            = None
+        self._group_worker:  GroupBackfillWorker | None     = None
+        self._market_prices: dict[int, float]               = {}
 
         self.setWindowTitle("EVE Rock – Mining Tracker")
         self.setMinimumSize(1200, 680)
         self.resize(1500, 800)
         self._build_ui()
         self._load_existing_characters()
+        self._fetch_prices_bg()   # load prices in background on startup
+        self._backfill_groups_bg()  # fill missing group names at startup
+
+    def _fetch_prices_bg(self):
+        if self._prices_worker and self._prices_worker.isRunning():
+            return
+        self._prices_worker = PricesWorker()
+        self._prices_worker.finished.connect(self._on_prices_fetched, Qt.ConnectionType.QueuedConnection)
+        self._prices_worker.start()
+
+    def _backfill_groups_bg(self):
+        if self._group_worker and self._group_worker.isRunning():
+            return
+        self._group_worker = GroupBackfillWorker(self._db)
+        self._group_worker.finished.connect(self._refresh_current_tab, Qt.ConnectionType.QueuedConnection)
+        self._group_worker.start()
+
+    def _on_prices_fetched(self, prices: dict):
+        if prices:
+            self._market_prices = prices
+            self._refresh_current_tab()
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -530,9 +609,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(hdr)
 
         self._char_list = QListWidget()
+        self._char_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._char_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._char_list.customContextMenuRequested.connect(self._on_char_context_menu)
-        self._char_list.currentItemChanged.connect(self._on_char_selected)
+        self._char_list.itemSelectionChanged.connect(self._on_char_selected)
         lay.addWidget(self._char_list)
 
         # "All Characters" entry
@@ -605,10 +685,37 @@ class MainWindow(QMainWindow):
         for label, _ in _PERIOD_OPTIONS:
             self._mining_period.addItem(label)
         self._mining_period.setCurrentIndex(1)   # 30 days default
-        self._mining_period.currentIndexChanged.connect(self._refresh_mining_tab)
+        self._mining_period.currentIndexChanged.connect(self._on_mining_period_changed)
         fbar.addWidget(self._mining_period)
 
+        today = QDate.currentDate()
+        self._mining_from_lbl = QLabel("From:")
+        self._mining_from_lbl.setVisible(False)
+        fbar.addWidget(self._mining_from_lbl)
+        self._mining_from = QDateEdit(today.addDays(-30))
+        self._mining_from.setCalendarPopup(True)
+        self._mining_from.setDisplayFormat("yyyy-MM-dd")
+        self._mining_from.setVisible(False)
+        self._mining_from.dateChanged.connect(self._refresh_mining_tab)
+        fbar.addWidget(self._mining_from)
+
+        self._mining_to_lbl = QLabel("To:")
+        self._mining_to_lbl.setVisible(False)
+        fbar.addWidget(self._mining_to_lbl)
+        self._mining_to = QDateEdit(today)
+        self._mining_to.setCalendarPopup(True)
+        self._mining_to.setDisplayFormat("yyyy-MM-dd")
+        self._mining_to.setVisible(False)
+        self._mining_to.dateChanged.connect(self._refresh_mining_tab)
+        fbar.addWidget(self._mining_to)
+
         fbar.addStretch()
+
+        exp_btn = QPushButton("⬇  Export CSV")
+        exp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        exp_btn.setToolTip("Export current view to CSV")
+        exp_btn.clicked.connect(lambda: self._export_table_to_csv(self._mining_table, "character_mining"))
+        fbar.addWidget(exp_btn)
 
         sync_btn = QPushButton("↺  Refresh")
         sync_btn.setObjectName("blue_btn")
@@ -660,7 +767,42 @@ class MainWindow(QMainWindow):
 
     def _build_tab_moon(self) -> QWidget:
         w   = QWidget()
-        lay = QVBoxLayout(w)
+        root = QHBoxLayout(w)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Left character-filter panel ───────────────────────────────
+        char_panel = QWidget()
+        char_panel.setFixedWidth(160)
+        char_panel.setStyleSheet(
+            f"background-color: {PANEL_BG}; border-right: 1px solid {BORDER};"
+        )
+        cp_lay = QVBoxLayout(char_panel)
+        cp_lay.setContentsMargins(8, 10, 8, 10)
+        cp_lay.setSpacing(6)
+
+        ch_hdr = QLabel("CHARACTERS")
+        ch_hdr.setObjectName("section_label")
+        cp_lay.addWidget(ch_hdr)
+
+        self._moon_char_list = QListWidget()
+        self._moon_char_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._moon_char_list.setToolTip("Ctrl+click / Shift+click for multiple.\nNo selection = all characters.")
+        self._moon_char_list.setStyleSheet("background: transparent; border: none;")
+        self._moon_char_list.itemSelectionChanged.connect(self._refresh_moon_tab)
+        cp_lay.addWidget(self._moon_char_list)
+
+        clear_btn = QPushButton("Show All")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setToolTip("Clear selection to show all characters")
+        clear_btn.clicked.connect(self._moon_char_list.clearSelection)
+        cp_lay.addWidget(clear_btn)
+
+        root.addWidget(char_panel)
+
+        # ── Right content area ────────────────────────────────────────
+        right = QWidget()
+        lay   = QVBoxLayout(right)
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(8)
 
@@ -679,19 +821,61 @@ class MainWindow(QMainWindow):
 
         # Filter bar
         fbar = QHBoxLayout(); fbar.setSpacing(12)
+        fbar.addWidget(QLabel("Period:"))
+        self._moon_period = QComboBox()
+        for label, _ in _PERIOD_OPTIONS:
+            self._moon_period.addItem(label)
+        self._moon_period.setCurrentIndex(4)  # "All time" default
+        self._moon_period.currentIndexChanged.connect(self._on_moon_period_changed)
+        fbar.addWidget(self._moon_period)
+
+        today = QDate.currentDate()
+        self._moon_from_lbl = QLabel("From:")
+        self._moon_from_lbl.setVisible(False)
+        fbar.addWidget(self._moon_from_lbl)
+        self._moon_from = QDateEdit(today.addDays(-30))
+        self._moon_from.setCalendarPopup(True)
+        self._moon_from.setDisplayFormat("yyyy-MM-dd")
+        self._moon_from.setVisible(False)
+        self._moon_from.dateChanged.connect(self._refresh_moon_tab)
+        fbar.addWidget(self._moon_from)
+
+        self._moon_to_lbl = QLabel("To:")
+        self._moon_to_lbl.setVisible(False)
+        fbar.addWidget(self._moon_to_lbl)
+        self._moon_to = QDateEdit(today)
+        self._moon_to.setCalendarPopup(True)
+        self._moon_to.setDisplayFormat("yyyy-MM-dd")
+        self._moon_to.setVisible(False)
+        self._moon_to.dateChanged.connect(self._refresh_moon_tab)
+        fbar.addWidget(self._moon_to)
+
+        fbar.addSpacing(16)
         fbar.addWidget(QLabel("Observer:"))
         self._moon_observer = QComboBox()
         self._moon_observer.addItem("All Observers", None)
         self._moon_observer.currentIndexChanged.connect(self._refresh_moon_tab)
         fbar.addWidget(self._moon_observer)
 
-        fbar.addWidget(QLabel("Character:"))
-        self._moon_char_combo = QComboBox()
-        self._moon_char_combo.addItem("Any character", None)
-        self._moon_char_combo.currentIndexChanged.connect(self._refresh_moon_tab)
-        fbar.addWidget(self._moon_char_combo)
+        fbar.addSpacing(16)
+        fbar.addWidget(QLabel("Tax %:"))
+        self._moon_tax = QDoubleSpinBox()
+        self._moon_tax.setRange(0.0, 100.0)
+        self._moon_tax.setValue(15.0)
+        self._moon_tax.setSuffix(" %")
+        self._moon_tax.setDecimals(1)
+        self._moon_tax.setFixedWidth(90)
+        self._moon_tax.setToolTip("Corp tax rate applied to Est. ISK")
+        self._moon_tax.valueChanged.connect(self._refresh_moon_tab)
+        fbar.addWidget(self._moon_tax)
 
         fbar.addStretch()
+
+        exp_btn = QPushButton("⬇  Export CSV")
+        exp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        exp_btn.setToolTip("Export current view to CSV")
+        exp_btn.clicked.connect(lambda: self._export_table_to_csv(self._moon_table, "moon_mining"))
+        fbar.addWidget(exp_btn)
 
         self._moon_sync_btn = QPushButton("↺  Fetch Moon Mining")
         self._moon_sync_btn.setObjectName("blue_btn")
@@ -706,34 +890,39 @@ class MainWindow(QMainWindow):
         self._moonp_total  = _pill("Total units: —")
         self._moonp_m3     = _pill("Volume: —")
         self._moonp_isk    = _pill("Est. ISK: —")
+        self._moonp_tax    = _pill("Tax (15%): —")
         self._moonp_types  = _pill("Ore types: —")
         for p in (self._moonp_chars, self._moonp_total, self._moonp_m3,
-                  self._moonp_isk, self._moonp_types):
+                  self._moonp_isk, self._moonp_tax, self._moonp_types):
             prow.addWidget(p)
         prow.addStretch()
         lay.addLayout(prow)
 
         # Table
         self._moon_table = QTableWidget()
-        self._moon_table.setColumnCount(7)
+        self._moon_table.setColumnCount(9)
         self._moon_table.setHorizontalHeaderLabels([
             "Observer / Refinery", "Character", "Ore / Ice Type",
-            "Group", "Quantity", "Est. m³", "Last Updated"
+            "Group", "Quantity", "Est. m³", "Est. ISK", "Tax", "Last Updated"
         ])
         _setup_table(self._moon_table)
         hv = self._moon_table.horizontalHeader()
         for col, mode in [
-            (0, QHeaderView.ResizeMode.Interactive),
+            (0, QHeaderView.ResizeMode.Stretch),
             (1, QHeaderView.ResizeMode.ResizeToContents),
-            (2, QHeaderView.ResizeMode.Stretch),
+            (2, QHeaderView.ResizeMode.ResizeToContents),
             (3, QHeaderView.ResizeMode.ResizeToContents),
             (4, QHeaderView.ResizeMode.ResizeToContents),
             (5, QHeaderView.ResizeMode.ResizeToContents),
             (6, QHeaderView.ResizeMode.ResizeToContents),
+            (7, QHeaderView.ResizeMode.ResizeToContents),
+            (8, QHeaderView.ResizeMode.ResizeToContents),
         ]:
             hv.setSectionResizeMode(col, mode)
         self._moon_table.setColumnWidth(0, 220)
         lay.addWidget(self._moon_table)
+
+        root.addWidget(right, 1)
         return w
 
     # ── Tab: Summary ──────────────────────────────────────────────────
@@ -751,9 +940,38 @@ class MainWindow(QMainWindow):
         for label, _ in _PERIOD_OPTIONS:
             self._summary_period.addItem(label)
         self._summary_period.setCurrentIndex(1)
-        self._summary_period.currentIndexChanged.connect(self._refresh_summary_tab)
+        self._summary_period.currentIndexChanged.connect(self._on_summary_period_changed)
         fbar.addWidget(self._summary_period)
+
+        today = QDate.currentDate()
+        self._summary_from_lbl = QLabel("From:")
+        self._summary_from_lbl.setVisible(False)
+        fbar.addWidget(self._summary_from_lbl)
+        self._summary_from = QDateEdit(today.addDays(-30))
+        self._summary_from.setCalendarPopup(True)
+        self._summary_from.setDisplayFormat("yyyy-MM-dd")
+        self._summary_from.setVisible(False)
+        self._summary_from.dateChanged.connect(self._refresh_summary_tab)
+        fbar.addWidget(self._summary_from)
+
+        self._summary_to_lbl = QLabel("To:")
+        self._summary_to_lbl.setVisible(False)
+        fbar.addWidget(self._summary_to_lbl)
+        self._summary_to = QDateEdit(today)
+        self._summary_to.setCalendarPopup(True)
+        self._summary_to.setDisplayFormat("yyyy-MM-dd")
+        self._summary_to.setVisible(False)
+        self._summary_to.dateChanged.connect(self._refresh_summary_tab)
+        fbar.addWidget(self._summary_to)
+
         fbar.addStretch()
+
+        exp_btn = QPushButton("⬇  Export CSV")
+        exp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        exp_btn.setToolTip("Export both summary tables to CSV")
+        exp_btn.clicked.connect(self._export_summary_csv)
+        fbar.addWidget(exp_btn)
+
         lay.addLayout(fbar)
 
         # Two side-by-side tables
@@ -839,10 +1057,21 @@ class MainWindow(QMainWindow):
         self._add_char_to_list(char_id, char_name, corp_name)
 
     def _selected_char_id(self) -> int | None:
+        """Returns single char id for operations that need exactly one char (e.g. moon sync)."""
         item = self._char_list.currentItem()
         if not item:
             return None
         return item.data(Qt.ItemDataRole.UserRole)  # None = "All"
+
+    def _get_selected_char_ids(self) -> list[int] | None:
+        """Returns list of selected char IDs, or None meaning 'all characters'."""
+        selected = self._char_list.selectedItems()
+        if not selected:
+            return None
+        ids = [item.data(Qt.ItemDataRole.UserRole) for item in selected]
+        if None in ids:   # "All Characters" item is among selections
+            return None
+        return ids if ids else None
 
     def _on_char_selected(self):
         self._refresh_current_tab()
@@ -888,9 +1117,68 @@ class MainWindow(QMainWindow):
             self._char_list.setCurrentRow(0)
         self._refresh_current_tab()
 
-    # ------------------------------------------------------------------
-    # Add / sync workers
-    # ------------------------------------------------------------------
+    # ── Export helpers ──────────────────────────────────────────────
+
+    def _export_table_to_csv(self, table: QTableWidget, default_stem: str) -> None:
+        """Write every visible (non-hidden) column of *table* to a user-chosen CSV file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export to CSV",
+            f"{default_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        cols = table.columnCount()
+        rows = table.rowCount()
+        headers = [table.horizontalHeaderItem(c).text() for c in range(cols)]
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for r in range(rows):
+                    row_data = []
+                    for c in range(cols):
+                        item = table.item(r, c)
+                        row_data.append(item.text() if item else "")
+                    writer.writerow(row_data)
+            self._set_status(f"Exported {rows} rows → {path}")
+        except OSError as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+
+    def _export_summary_csv(self) -> None:
+        """Export both summary tables to separate CSV files (adds _by_character / _by_type suffixes)."""
+        stem = f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Summary CSV (base name)",
+            f"{stem}.csv",
+            "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        base = path[:-4] if path.lower().endswith(".csv") else path
+        for table, suffix in [
+            (self._sum_char_table, "_by_character"),
+            (self._sum_type_table, "_by_type"),
+        ]:
+            out = base + suffix + ".csv"
+            cols = table.columnCount()
+            rows = table.rowCount()
+            headers = [table.horizontalHeaderItem(c).text() for c in range(cols)]
+            try:
+                with open(out, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    for r in range(rows):
+                        writer.writerow([
+                            (table.item(r, c).text() if table.item(r, c) else "")
+                            for c in range(cols)
+                        ])
+            except OSError as e:
+                QMessageBox.warning(self, "Export failed", str(e))
+                return
+        self._set_status(f"Exported summary → {base}_by_character.csv / _by_type.csv")
+
+    # ── Sync workers ────────────────────────────────────────────────
 
     def _on_add_character(self):
         if self._add_worker and self._add_worker.isRunning():
@@ -940,10 +1228,7 @@ class MainWindow(QMainWindow):
         self._tokens = auth.load_all_tokens()   # pick up any refreshed tokens
         self._ts_lbl.setText(f"Last sync: {datetime.now().strftime('%H:%M:%S')}")
         self._set_status("Sync complete.")
-        try:
-            self._market_prices = esi.get_market_prices()
-        except Exception:
-            pass
+        self._fetch_prices_bg()   # refresh prices in background after sync
         self._refresh_current_tab()
 
     def _on_sync_error(self, msg: str):
@@ -1004,6 +1289,8 @@ class MainWindow(QMainWindow):
         self._refresh_current_tab()
 
     def _refresh_current_tab(self):
+        if not hasattr(self, '_tabs'):
+            return
         idx = self._tabs.currentIndex()
         if idx == 0:
             self._refresh_mining_tab()
@@ -1012,9 +1299,44 @@ class MainWindow(QMainWindow):
         elif idx == 2:
             self._refresh_summary_tab()
 
-    def _get_date_range(self, combo: QComboBox) -> tuple[str | None, str | None]:
+    def _on_mining_period_changed(self):
+        idx  = self._mining_period.currentIndex()
+        days = _PERIOD_OPTIONS[idx][1] if idx >= 0 else 30
+        custom = (days == -1)
+        self._mining_from_lbl.setVisible(custom)
+        self._mining_from.setVisible(custom)
+        self._mining_to_lbl.setVisible(custom)
+        self._mining_to.setVisible(custom)
+        self._refresh_mining_tab()
+
+    def _on_moon_period_changed(self):
+        idx  = self._moon_period.currentIndex()
+        days = _PERIOD_OPTIONS[idx][1] if idx >= 0 else None
+        custom = (days == -1)
+        self._moon_from_lbl.setVisible(custom)
+        self._moon_from.setVisible(custom)
+        self._moon_to_lbl.setVisible(custom)
+        self._moon_to.setVisible(custom)
+        self._refresh_moon_tab()
+
+    def _on_summary_period_changed(self):
+        idx  = self._summary_period.currentIndex()
+        days = _PERIOD_OPTIONS[idx][1] if idx >= 0 else 30
+        custom = (days == -1)
+        self._summary_from_lbl.setVisible(custom)
+        self._summary_from.setVisible(custom)
+        self._summary_to_lbl.setVisible(custom)
+        self._summary_to.setVisible(custom)
+        self._refresh_summary_tab()
+
+    def _get_date_range(self, combo: QComboBox,
+                        from_edit: QDateEdit | None = None,
+                        to_edit:   QDateEdit | None = None) -> tuple[str | None, str | None]:
         idx  = combo.currentIndex()
         days = _PERIOD_OPTIONS[idx][1] if idx >= 0 else 30
+        if days == -1 and from_edit and to_edit:
+            return (from_edit.date().toString("yyyy-MM-dd"),
+                    to_edit.date().toString("yyyy-MM-dd"))
         return _period_dates(days)
 
     def _get_selected_char_ids(self) -> list[int] | None:
@@ -1025,16 +1347,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_mining_tab(self):
         char_ids             = self._get_selected_char_ids()
-        start_date, end_date = self._get_date_range(self._mining_period)
+        start_date, end_date = self._get_date_range(self._mining_period, self._mining_from, self._mining_to)
         rows = self._db.get_mining_history(char_ids, start_date, end_date)
 
-        if not self._market_prices:
-            try:
-                self._market_prices = esi.get_market_prices()
-            except Exception:
-                pass
-
         self._mining_table.setSortingEnabled(False)
+        self._mining_table.setUpdatesEnabled(False)
         self._mining_table.setRowCount(len(rows))
 
         total_units = 0
@@ -1071,6 +1388,7 @@ class MainWindow(QMainWindow):
             self._mining_table.setItem(r, 7, _num_cell(isk, _fmt_isk(isk)))
             self._mining_table.setItem(r, 8, _cell(str(row["id"])))
 
+        self._mining_table.setUpdatesEnabled(True)
         self._mining_table.setSortingEnabled(True)
 
         # Update pills
@@ -1100,35 +1418,41 @@ class MainWindow(QMainWindow):
             if obs_id is not None:
                 obs_ids = [obs_id]
 
-        rows = self._db.get_moon_mining(obs_ids)
+        start_date, end_date = self._get_date_range(self._moon_period, self._moon_from, self._moon_to)
+        rows = self._db.get_moon_mining(obs_ids, start_date, end_date)
 
-        if not self._market_prices:
-            try:
-                self._market_prices = esi.get_market_prices()
-            except Exception:
-                pass
-
-        # Apply character filter from moon char combo
-        char_filter = self._moon_char_combo.currentData()
-
-        # Refresh char combo
+        # Refresh character list widget, preserving selection by name
         chars_in_rows = {(r["character_id"], r["character_name"]) for r in rows}
-        self._moon_char_combo.blockSignals(True)
-        self._moon_char_combo.clear()
-        self._moon_char_combo.addItem("Any character", None)
+        prev_selected = {item.data(Qt.ItemDataRole.UserRole)
+                         for item in self._moon_char_list.selectedItems()}
+        self._moon_char_list.blockSignals(True)
+        self._moon_char_list.clear()
         for cid, cname in sorted(chars_in_rows, key=lambda x: x[1]):
-            self._moon_char_combo.addItem(cname, cid)
-        self._moon_char_combo.blockSignals(False)
+            item = QListWidgetItem(cname)
+            item.setData(Qt.ItemDataRole.UserRole, cid)
+            item.setSizeHint(QSize(0, 22))  # compact row height
+            self._moon_char_list.addItem(item)
+            if cid in prev_selected:
+                item.setSelected(True)
+        self._moon_char_list.blockSignals(False)
 
-        if char_filter is not None:
-            rows = [r for r in rows if r["character_id"] == char_filter]
+        # Apply character filter — empty selection means all
+        selected_ids = {item.data(Qt.ItemDataRole.UserRole)
+                        for item in self._moon_char_list.selectedItems()}
+        if selected_ids:
+            rows = [r for r in rows if r["character_id"] in selected_ids]
+
+        tax_rate = self._moon_tax.value() / 100.0
 
         self._moon_table.setSortingEnabled(False)
-        self._moon_table.setRowCount(len(rows))
+        self._moon_table.setUpdatesEnabled(False)
+        # +1 row for totals footer
+        self._moon_table.setRowCount(len(rows) + 1)
 
         total_units = 0
         total_m3    = 0.0
         total_isk   = 0.0
+        total_tax   = 0.0
         chars_seen: set = set()
         types_seen: set = set()
 
@@ -1137,11 +1461,13 @@ class MainWindow(QMainWindow):
             vol   = (row["unit_volume"] or 0.0) * qty
             price = self._market_prices.get(row["type_id"], 0.0)
             isk   = price * qty
+            tax   = isk * tax_rate
             group = row["group_name"] or ""
 
             total_units += qty
             total_m3    += vol
             total_isk   += isk
+            total_tax   += tax
             chars_seen.add(row["character_id"])
             types_seen.add(row["type_id"])
 
@@ -1151,26 +1477,48 @@ class MainWindow(QMainWindow):
             self._moon_table.setItem(r, 3, _cell(group))
             self._moon_table.setItem(r, 4, _num_cell(qty, _fmt_quantity(qty)))
             self._moon_table.setItem(r, 5, _num_cell(vol, _fmt_m3(vol)))
-            self._moon_table.setItem(r, 6, _cell(str(row["last_updated"] or "")))
+            self._moon_table.setItem(r, 6, _num_cell(isk, _fmt_isk(isk)))
+            self._moon_table.setItem(r, 7, _num_cell(tax, _fmt_isk(tax)))
+            self._moon_table.setItem(r, 8, _cell(str(row["last_updated"] or "")))
 
+        # Totals row
+        tr = len(rows)
+        bold = QFont(); bold.setBold(True)
+        def _total_cell(text: str, val: float = 0) -> QTableWidgetItem:
+            item = _num_cell(val, text)
+            item.setFont(bold)
+            item.setForeground(QColor(ORE_GOLD))
+            return item
+        def _total_label(text: str) -> QTableWidgetItem:
+            item = QTableWidgetItem(text)
+            item.setFont(bold)
+            item.setForeground(QColor(ORE_GOLD))
+            return item
+        self._moon_table.setItem(tr, 0, _total_label("TOTALS"))
+        self._moon_table.setItem(tr, 1, _total_label(""))
+        self._moon_table.setItem(tr, 2, _total_label(""))
+        self._moon_table.setItem(tr, 3, _total_label(""))
+        self._moon_table.setItem(tr, 4, _total_cell(_fmt_quantity(total_units), total_units))
+        self._moon_table.setItem(tr, 5, _total_cell(_fmt_m3(total_m3), total_m3))
+        self._moon_table.setItem(tr, 6, _total_cell(_fmt_isk(total_isk), total_isk))
+        self._moon_table.setItem(tr, 7, _total_cell(_fmt_isk(total_tax), total_tax))
+        self._moon_table.setItem(tr, 8, _total_label(""))
+
+        self._moon_table.setUpdatesEnabled(True)
         self._moon_table.setSortingEnabled(True)
 
+        pct = self._moon_tax.value()
         self._moonp_chars.setText( f"Characters: {len(chars_seen)}")
         self._moonp_total.setText( f"Total units: {_fmt_quantity(total_units)}")
         self._moonp_m3.setText(    f"Volume: {_fmt_m3(total_m3)}")
         self._moonp_isk.setText(   f"Est. ISK: {_fmt_isk(total_isk)}")
+        self._moonp_tax.setText(   f"Tax ({pct:.0f}%): {_fmt_isk(total_tax)}")
         self._moonp_types.setText( f"Ore types: {len(types_seen)}")
 
     # ── Summary tab ────────────────────────────────────────────────────
 
     def _refresh_summary_tab(self):
-        start_date, end_date = self._get_date_range(self._summary_period)
-
-        if not self._market_prices:
-            try:
-                self._market_prices = esi.get_market_prices()
-            except Exception:
-                pass
+        start_date, end_date = self._get_date_range(self._summary_period, self._summary_from, self._summary_to)
 
         # By character
         char_rows = self._db.get_mining_summary_by_character(start_date, end_date)

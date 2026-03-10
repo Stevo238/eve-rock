@@ -179,6 +179,23 @@ class Database:
             "SELECT * FROM type_cache WHERE type_id = ?", (type_id,)
         ).fetchone()
 
+    def get_types_missing_group_name(self) -> list[tuple[int, int]]:
+        """Return [(type_id, group_id)] for cached types that have a group_id but no group_name yet."""
+        rows = self.conn.execute(
+            "SELECT type_id, group_id FROM type_cache "
+            "WHERE group_id IS NOT NULL AND (group_name IS NULL OR group_name = '')"
+        ).fetchall()
+        return [(r["type_id"], r["group_id"]) for r in rows]
+
+    def update_group_name(self, type_id: int, group_name: str) -> None:
+        """Update only the group_name for an existing type_cache entry."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE type_cache SET group_name = ? WHERE type_id = ?",
+                (group_name, type_id)
+            )
+            self.conn.commit()
+
     def get_known_type_ids(self) -> set[int]:
         rows = self.conn.execute("SELECT type_id FROM type_cache").fetchall()
         return {r[0] for r in rows}

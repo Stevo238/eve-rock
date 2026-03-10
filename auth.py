@@ -29,10 +29,11 @@ SSO_VERIFY_URL = "https://login.eveonline.com/oauth/verify"
 CALLBACK_PORT = 45679                          # different from eve-gas-man (45678)
 REDIRECT_URI  = f"http://localhost:{CALLBACK_PORT}/callback"
 
-# Both scopes requested – corp mining silently fails if character lacks the role.
+# Scopes requested at login.
 SCOPES = (
     "esi-industry.read_character_mining.v1 "
-    "esi-industry.read_corporation_mining.v1"
+    "esi-industry.read_corporation_mining.v1 "
+    "esi-universe.read_structures.v1"
 )
 
 TOKEN_FILE = Path.home() / ".eve_rock_tokens.json"

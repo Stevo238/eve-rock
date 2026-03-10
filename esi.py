@@ -210,9 +210,26 @@ def get_types_batch(type_ids: list[int], access_token: str) -> dict[int, dict]:
     return results
 
 
-def get_group_name(group_id: int, access_token: str) -> str:
-    r = requests.get(f"{ESI_BASE}/universe/groups/{group_id}/", headers=_h(access_token), timeout=10)
+def get_group_name(group_id: int, access_token: str = "") -> str:
+    headers = _h(access_token) if access_token else {"Accept": "application/json"}
+    r = requests.get(f"{ESI_BASE}/universe/groups/{group_id}/", headers=headers, timeout=10)
     return r.json().get("name", f"Group {group_id}") if r.ok else f"Group {group_id}"
+
+
+def get_groups_batch(group_ids: list[int], access_token: str = "") -> dict[int, str]:
+    """Fetch group names for multiple group IDs concurrently (public endpoint, no auth required)."""
+    if not group_ids:
+        return {}
+    results: dict[int, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(get_group_name, gid, access_token): gid for gid in group_ids}
+        for future in concurrent.futures.as_completed(futures):
+            gid = futures[future]
+            try:
+                results[gid] = future.result()
+            except Exception:
+                results[gid] = f"Group {gid}"
+    return results
 
 
 # ---------------------------------------------------------------------------
